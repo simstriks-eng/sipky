@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Vision Darts Scoreboard</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --accent: #10b981;
+      --accent-active: #059669;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --danger: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: var(--bg); color: var(--text); padding: 12px; display: flex; flex-direction: column; gap: 12px; height: 100vh; }
+    
+    .scoreboard { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .player-card { background: var(--card); padding: 12px; border-radius: 10px; border: 2px solid transparent; text-align: center; }
+    .player-card.active { border-color: var(--accent); }
+    .player-name { font-size: 1rem; color: var(--text-muted); }
+    .player-score { font-size: 2.2rem; font-weight: 800; color: var(--text); }
+    .turn-darts { display: flex; justify-content: center; gap: 6px; margin-top: 6px; height: 24px; }
+    .dart-pill { background: #334155; padding: 2px 8px; border-radius: 12px; font-size: 0.8rem; font-weight: bold; }
+
+    .viewport { position: relative; width: 100%; flex: 1; min-height: 240px; background: #000; border-radius: 12px; overflow: hidden; }
+    video { width: 100%; height: 100%; object-fit: cover; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; }
+
+    .controls { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    button { background: var(--card); color: var(--text); border: none; padding: 12px; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; }
+    button:active { opacity: 0.8; }
+    button.primary { background: var(--accent); grid-column: span 2; }
+    button.danger { background: var(--danger); }
+
+    .history-panel { max-height: 90px; overflow-y: auto; background: var(--card); border-radius: 8px; padding: 8px; font-size: 0.8rem; color: var(--text-muted); }
+    .history-entry { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px solid #334155; }
+  </style>
+</head>
+<body>
+
+  <div class="scoreboard">
+    <div class="player-card active" id="card-0">
+      <div class="player-name" id="name-0">Hráč 1</div>
+      <div class="player-score" id="score-0">501</div>
+      <div class="turn-darts" id="darts-0"></div>
+    </div>
+    <div class="player-card" id="card-1">
+      <div class="player-name" id="name-1">Hráč 2</div>
+      <div class="player-score" id="score-1">501</div>
+      <div class="turn-darts" id="darts-1"></div>
+    </div>
+  </div>
+
+  <div class="viewport" id="viewport">
+    <video id="webcam" playsinline autoplay muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="controls">
+    <button onclick="undoLast()">Zpět</button>
+    <button onclick="calibrateCenter()">Kalibrovat</button>
+    <button class="primary" id="btn-next" onclick="nextTurn()">Další hráč</button>
+    <button class="danger" onclick="resetGame()">Reset</button>
+  </div>
+
+  <div class="history-panel" id="history">
+    <div style="text-align: center;">Historie odhozů</div>
+  </div>
+
+  <script>
+    const SECTOR_ANGLES = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5];
+
+    let state = {
+      players: [
+        { name: "Hráč 1", score: 501, initial: 501 },
+        { name: "Hráč 2", score: 501, initial: 501 }
+      ],
+      activeIdx: 0,
+      currentTurnDarts: [],
+      history: [],
+      center: null,
+      outerRadius: null
+    };
+
+    const video = document.getElementById("webcam");
+    const canvas = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+
+    // Inicializace kamery
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false
+    }).then(stream => {
+      video.srcObject = stream;
+      video.play();
+      requestAnimationFrame(renderLoop);
+    }).catch(err => {
+      console.warn("Kamera nedostupná:", err);
+      requestAnimationFrame(renderLoop);
+    });
+
+    function resizeCanvas() {
+      canvas.width = canvas.clientWidth;
+      canvas.height = canvas.clientHeight;
+      if (!state.center) {
+        state.center = { x: canvas.width / 2, y: canvas.height / 2 };
+        state.outerRadius = Math.min(canvas.width, canvas.height) * 0.42;
+      }
+    }
+    window.addEventListener("resize", resizeCanvas);
+    setTimeout(resizeCanvas, 300);
+
+    // Výpočet bodů podle polárních souřadnic
+    function evaluateHit(x, y) {
+      if (!state.center || !state.outerRadius) return { text: "MISS", points: 0 };
+      const dx = x - state.center.x;
+      const dy = y - state.center.y;
+      const r = Math.sqrt(dx * dx + dy * dy);
+      const ratio = r / state.outerRadius;
+
+      if (ratio > 1.0) return { text: "OUT", points: 0, mult: 0, base: 0 };
+
+      // Bullseye standardní proporce
+      if (ratio <= 0.037) return { text: "D-BULL", points: 50, mult: 2, base: 25 };
+      if (ratio <= 0.093) return { text: "BULL", points: 25, mult: 1, base: 25 };
+
+      // Úhel (posun o 90° pro T20 nahoře a půlsegment 9°)
+      let angle = (Math.atan2(dy, dx) * 180 / Math.PI) + 90;
+      if (angle < 0) angle += 360;
+      const sectorIdx = Math.floor(((angle + 9) % 360) / 18);
+      const sectorVal = SECTOR_ANGLES[sectorIdx];
+
+      // Triple & Double zóny (BDO/WDF standard poměry k double wire)
+      if (ratio >= 0.54 && ratio <= 0.63) {
+        return { text: `T${sectorVal}`, points: sectorVal * 3, mult: 3, base: sectorVal };
+      }
+      if (ratio >= 0.92 && ratio <= 1.0) {
+        return { text: `D${sectorVal}`, points: sectorVal * 2, mult: 2, base: sectorVal };
+      }
+
+      return { text: `S${sectorVal}`, points: sectorVal, mult: 1, base: sectorVal };
+    }
+
+    // Virtuální záznam hodu tapnutím na terč
+    canvas.addEventListener("pointerdown", (e) => {
+      if (state.currentTurnDarts.length >= 3) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      const hit = evaluateHit(x, y);
+      registerDart(hit, { x, y });
+    });
+
+    function registerDart(hit, coords) {
+      const player = state.players[state.activeIdx];
+      const remaining = player.score - hit.points;
+
+      if (remaining < 0 || remaining === 1) {
+        // Bust
+        state.currentTurnDarts.push({ ...hit, bust: true, coords });
+        alert(`Bust! Hráč ${player.name} přehodil.`);
+        nextTurn(true);
+        return;
+      }
+
+      state.currentTurnDarts.push({ ...hit, coords });
+      player.score = remaining;
+
+      if (remaining === 0) {
+        alert(`Konec hry! Vítězí ${player.name}`);
+        resetGame();
+        return;
+      }
+
+      updateUI();
+    }
+
+    function nextTurn(wasBust = false) {
+      const player = state.players[state.activeIdx];
+      const turnScore = state.currentTurnDarts.reduce((acc, d) => acc + (d.bust ? 0 : d.points), 0);
+
+      state.history.unshift({
+        player: player.name,
+        darts: state.currentTurnDarts.map(d => d.text).join(", ") || "Bez hodu",
+        total: wasBust ? "BUST" : turnScore,
+        remaining: player.score
+      });
+
+      if (wasBust) {
+        const revert = state.currentTurnDarts.reduce((acc, d) => acc + (d.bust ? 0 : d.points), 0);
+        player.score += revert;
+      }
+
+      state.currentTurnDarts = [];
+      state.activeIdx = (state.activeIdx + 1) % 2;
+      updateUI();
+    }
+
+    function undoLast() {
+      if (state.currentTurnDarts.length > 0) {
+        const dart = state.currentTurnDarts.pop();
+        if (!dart.bust) state.players[state.activeIdx].score += dart.points;
+      } else if (state.history.length > 0) {
+        const last = state.history.shift();
+        state.activeIdx = (state.activeIdx - 1 + 2) % 2;
+        // Obnovení stavu pro jednoduchý rollback
+        state.players[state.activeIdx].score = last.remaining + (last.total === "BUST" ? 0 : last.total);
+      }
+      updateUI();
+    }
+
+    function calibrateCenter() {
+      state.center = { x: canvas.width / 2, y: canvas.height / 2 };
+      state.outerRadius = Math.min(canvas.width, canvas.height) * 0.42;
+      updateUI();
+    }
+
+    function resetGame() {
+      state.players.forEach(p => p.score = p.initial);
+      state.activeIdx = 0;
+      state.currentTurnDarts = [];
+      state.history = [];
+      updateUI();
+    }
+
+    function updateUI() {
+      state.players.forEach((p, i) => {
+        document.getElementById(`score-${i}`).innerText = p.score;
+        document.getElementById(`card-${i}`).className = `player-card ${state.activeIdx === i ? 'active' : ''}`;
+        
+        const pillContainer = document.getElementById(`darts-${i}`);
+        pillContainer.innerHTML = "";
+        if (state.activeIdx === i) {
+          state.currentTurnDarts.forEach(d => {
+            const span = document.createElement("span");
+            span.className = "dart-pill";
+            span.innerText = d.text;
+            pillContainer.appendChild(span);
+          });
+        }
+      });
+
+      const histEl = document.getElementById("history");
+      histEl.innerHTML = `<div style="text-align: center; font-weight: bold; margin-bottom: 4px;">Historie odhozů</div>`;
+      state.history.slice(0, 5).forEach(h => {
+        const row = document.createElement("div");
+        row.className = "history-entry";
+        row.innerHTML = `<span>${h.player}: [${h.darts}]</span><span>${h.total} (zbylo ${h.remaining})</span>`;
+        histEl.appendChild(row);
+      });
+    }
+
+    // Vykreslování kalibrační mřížky a dopadů
+    function renderLoop() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (state.center && state.outerRadius) {
+        const c = state.center;
+        const r = state.outerRadius;
+
+        // Vnější okraj a segmenty
+        ctx.strokeStyle = "rgba(16, 185, 129, 0.4)";
+        ctx.lineWidth = 1.5;
+
+        [1.0, 0.92, 0.63, 0.54, 0.093, 0.037].forEach(ratio => {
+          ctx.beginPath();
+          ctx.arc(c.x, c.y, r * ratio, 0, 2 * Math.PI);
+          ctx.stroke();
+        });
+
+        // Vykreslení aktuálních hrotů šipek
+        state.currentTurnDarts.forEach((d, idx) => {
+          if (!d.coords) return;
+          ctx.fillStyle = "#ef4444";
+          ctx.beginPath();
+          ctx.arc(d.coords.x, d.coords.y, 6, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.strokeStyle = "#fff";
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        });
+      }
+
+      requestAnimationFrame(renderLoop);
+    }
+  </script>
+</body>
+</html>
